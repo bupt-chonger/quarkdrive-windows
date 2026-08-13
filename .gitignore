@@ -1,0 +1,8 @@
+/target/
+/.cargo/
+/.idea/
+/.vscode/
+*.pdb
+*.log
+config.local.json
+dist/*.exe
