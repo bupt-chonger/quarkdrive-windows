@@ -1,9 +1,14 @@
 use std::{
+    fs::File,
+    io::Read,
     ops::Range,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use md5::{Digest, Md5};
 use qrcode::{QrCode, types::Color};
 use reqwest::{
     Url,
@@ -12,9 +17,12 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use sha1::Sha1;
 use thiserror::Error;
 
 const BASE_URL: &str = "https://drive.quark.cn";
+const API_PARAMS: &[(&str, &str)] = &[("pr", "ucpro"), ("fr", "pc"), ("uc_param_str", "")];
+const OSS_USER_AGENT: &str = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RemoteItem {
@@ -30,6 +38,8 @@ pub struct RemoteItem {
 
 #[derive(Debug, Error)]
 pub enum QuarkError {
+    #[error("本地文件操作失败: {0}")]
+    Io(#[from] std::io::Error),
     #[error("网络请求失败: {0}")]
     Http(#[from] reqwest::Error),
     #[error("夸克接口返回错误 {code}: {message}")]
@@ -143,7 +153,7 @@ impl QuarkQrLogin {
             {
                 return self.finish_login(&ticket);
             }
-            if matches!(status, 50_004_002 | 50_004_003 | 50_004_004) {
+            if matches!(status, 50_004_002..=50_004_004) {
                 return Err(QuarkError::Login(
                     value_string(&response, &["message"]).unwrap_or_else(|| "二维码已失效".into()),
                 ));
@@ -295,6 +305,7 @@ impl QuarkClient {
     }
 
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<RemoteItem>, QuarkError> {
+        let started = Instant::now();
         let mut result = Vec::new();
         let mut page = 1_u32;
         loop {
@@ -329,10 +340,21 @@ impl QuarkClient {
             page += 1;
         }
         result.sort_by_key(|item| item.name.to_lowercase());
+        tracing::info!(
+            target: "quarkdrive::api",
+            operation = "list_children",
+            endpoint = "/1/clouddrive/file/sort",
+            parent_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            returned = result.len(),
+            result = "ok",
+            "夸克 API 调用完成"
+        );
         Ok(result)
     }
 
     pub fn download_range(&self, file_id: &str, range: Range<u64>) -> Result<Vec<u8>, QuarkError> {
+        let started = Instant::now();
         let envelope: Envelope<Vec<DownloadData>> = self
             .client
             .post(format!(
@@ -364,9 +386,354 @@ impl QuarkClient {
                 .unwrap_or(usize::MAX)
                 .min(bytes.len());
             let length = usize::try_from(range.end - range.start).unwrap_or(usize::MAX);
-            return Ok(bytes[start..bytes.len().min(start.saturating_add(length))].to_vec());
+            let data = bytes[start..bytes.len().min(start.saturating_add(length))].to_vec();
+            tracing::info!(
+                target: "quarkdrive::api",
+                operation = "download_range",
+                endpoint = "/1/clouddrive/file/download",
+                file_id,
+                requested_bytes = range.end.saturating_sub(range.start),
+                returned = data.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                result = "ok",
+                "夸克 API 调用完成"
+            );
+            return Ok(data);
         }
+        tracing::info!(
+            target: "quarkdrive::api",
+            operation = "download_range",
+            endpoint = "/1/clouddrive/file/download",
+            file_id,
+            requested_bytes = range.end.saturating_sub(range.start),
+            returned = bytes.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            result = "ok",
+            "夸克 API 调用完成"
+        );
         Ok(bytes)
+    }
+
+    pub fn create_folder(&self, parent_id: &str, name: &str) -> Result<String, QuarkError> {
+        let started = Instant::now();
+        let response: Envelope<serde_json::Value> = self
+            .client
+            .post(format!("{BASE_URL}/1/clouddrive/file"))
+            .query(API_PARAMS)
+            .header("Cookie", &self.cookie)
+            .header("Referer", "https://pan.quark.cn/")
+            .json(&json!({
+                "pdir_fid": parent_id,
+                "file_name": name,
+                "dir_path": "",
+                "dir_init_lock": false,
+            }))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let data = response.into_data()?;
+        let id = first_json_string(&data, &[&["fid"], &["data", "fid"]])
+            .ok_or(QuarkError::Malformed("data.fid"))?;
+        tracing::info!(
+            target: "quarkdrive::api",
+            operation = "create_folder",
+            endpoint = "/1/clouddrive/file",
+            parent_id,
+            name,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            returned = 1,
+            result = "ok",
+            "夸克 API 调用完成"
+        );
+        Ok(id)
+    }
+
+    pub fn move_file(&self, file_id: &str, target_parent_id: &str) -> Result<(), QuarkError> {
+        self.file_operation(
+            "move_file",
+            "/1/clouddrive/file/move",
+            json!({
+                "action_type": 2,
+                "exclude_fids": [],
+                "filelist": [file_id],
+                "to_pdir_fid": target_parent_id,
+            }),
+        )
+    }
+
+    pub fn rename_file(&self, file_id: &str, name: &str) -> Result<(), QuarkError> {
+        self.file_operation(
+            "rename_file",
+            "/1/clouddrive/file/rename",
+            json!({"fid": file_id, "file_name": name}),
+        )
+    }
+
+    fn file_operation(
+        &self,
+        operation: &'static str,
+        endpoint: &'static str,
+        body: serde_json::Value,
+    ) -> Result<(), QuarkError> {
+        let started = Instant::now();
+        let envelope: Envelope<serde_json::Value> = self
+            .client
+            .post(format!("{BASE_URL}{endpoint}"))
+            .query(API_PARAMS)
+            .header("Cookie", &self.cookie)
+            .header("Referer", "https://pan.quark.cn/")
+            .json(&body)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        envelope.into_data()?;
+        tracing::info!(
+            target: "quarkdrive::api",
+            operation,
+            endpoint,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            returned = 0,
+            result = "ok",
+            "夸克 API 调用完成"
+        );
+        Ok(())
+    }
+
+    pub fn upload_file(&self, path: &Path, parent_id: &str) -> Result<RemoteItem, QuarkError> {
+        let started = Instant::now();
+        let metadata = std::fs::metadata(path).map_err(|err| QuarkError::Login(err.to_string()))?;
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(QuarkError::Malformed("local file name"))?;
+        let size = metadata.len();
+        let (md5, sha1) = file_hashes(path)?;
+        let pre_response: serde_json::Value = self
+            .client
+            .post(format!("{BASE_URL}/1/clouddrive/file/upload/pre"))
+            .query(API_PARAMS)
+            .header("Cookie", &self.cookie)
+            .header("Referer", "https://pan.quark.cn/")
+            .json(&json!({
+                "ccp_hash_update": true,
+                "parallel_upload": false,
+                "dir_name": "",
+                "file_name": name,
+                "format_type": "application/octet-stream",
+                "l_created_at": metadata.created().ok().and_then(unix_time_ms),
+                "l_updated_at": metadata.modified().ok().and_then(unix_time_ms),
+                "pdir_fid": parent_id,
+                "size": size,
+            }))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        ensure_success(&pre_response)?;
+        let data = pre_response
+            .get("data")
+            .cloned()
+            .ok_or(QuarkError::Malformed("data"))?;
+        let task_id = json_string(&data, "task_id")?;
+        let obj_key = json_string(&data, "obj_key")?;
+        let upload_id = json_string(&data, "upload_id")?;
+        let bucket = json_string(&data, "bucket")?;
+        let upload_url = json_string(&data, "upload_url")?;
+        let auth_info = data
+            .get("auth_info")
+            .cloned()
+            .ok_or(QuarkError::Malformed("data.auth_info"))?;
+        let callback = data.get("callback").cloned().unwrap_or_else(|| json!({}));
+        let hash_response: serde_json::Value = self
+            .client
+            .post(format!("{BASE_URL}/1/clouddrive/file/update/hash"))
+            .query(API_PARAMS)
+            .header("Cookie", &self.cookie)
+            .header("Referer", "https://pan.quark.cn/")
+            .json(&json!({"md5": md5, "sha1": sha1, "task_id": task_id}))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        ensure_success(&hash_response)?;
+        let rapid = hash_response
+            .get("data")
+            .and_then(|value| value.get("finish"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if !rapid {
+            let part_size = data
+                .get("part_size")
+                .and_then(value_u64)
+                .unwrap_or(8 * 1024 * 1024) as usize;
+            let mut file = File::open(path).map_err(|err| QuarkError::Login(err.to_string()))?;
+            let mut part_number = 1_u32;
+            let mut etags = Vec::new();
+            loop {
+                let mut part = vec![0_u8; part_size];
+                let count = file.read(&mut part)?;
+                if count == 0 {
+                    break;
+                }
+                part.truncate(count);
+                let etag = self.upload_part(
+                    &upload_url,
+                    &bucket,
+                    &obj_key,
+                    &upload_id,
+                    &task_id,
+                    &auth_info,
+                    part_number,
+                    part,
+                )?;
+                etags.push(etag);
+                part_number += 1;
+            }
+            self.commit_upload(
+                &upload_url,
+                &bucket,
+                &obj_key,
+                &upload_id,
+                &task_id,
+                &auth_info,
+                &callback,
+                &etags,
+            )?;
+        }
+        let finish_response: serde_json::Value = self
+            .client
+            .post(format!("{BASE_URL}/1/clouddrive/file/upload/finish"))
+            .query(API_PARAMS)
+            .header("Cookie", &self.cookie)
+            .header("Referer", "https://pan.quark.cn/")
+            .json(&json!({"obj_key": obj_key, "task_id": task_id}))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        ensure_success(&finish_response)?;
+        let item = self
+            .list_children(parent_id)?
+            .into_iter()
+            .rev()
+            .find(|item| !item.is_directory && item.name == name && item.size == size)
+            .ok_or(QuarkError::Malformed("uploaded file metadata"))?;
+        tracing::info!(
+            target: "quarkdrive::api",
+            operation = "upload_file",
+            endpoint = "/1/clouddrive/file/upload",
+            parent_id,
+            name,
+            bytes = size,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            returned = 1,
+            result = "ok",
+            "夸克 API 调用完成"
+        );
+        Ok(item)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_part(
+        &self,
+        upload_url: &str,
+        bucket: &str,
+        obj_key: &str,
+        upload_id: &str,
+        task_id: &str,
+        auth_info: &serde_json::Value,
+        part_number: u32,
+        part: Vec<u8>,
+    ) -> Result<String, QuarkError> {
+        let date = http_date();
+        let auth_meta = format!(
+            "PUT\\n\\napplication/octet-stream\\n{date}\\nx-oss-date:{date}\\nx-oss-user-agent:{OSS_USER_AGENT}\\n/{bucket}/{obj_key}?partNumber={part_number}&uploadId={upload_id}"
+        );
+        let auth = self.upload_auth(task_id, auth_info, &auth_meta)?;
+        let response = self
+            .client
+            .put(oss_endpoint(upload_url, bucket, obj_key))
+            .query(&[
+                ("partNumber", part_number.to_string()),
+                ("uploadId", upload_id.to_string()),
+            ])
+            .header("Authorization", auth)
+            .header("Content-Type", "application/octet-stream")
+            .header("Referer", "https://pan.quark.cn/")
+            .header("x-oss-date", date)
+            .header("x-oss-user-agent", OSS_USER_AGENT)
+            .body(part)
+            .send()?
+            .error_for_status()?;
+        response
+            .headers()
+            .get("ETag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .ok_or(QuarkError::Malformed("upload part ETag"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_upload(
+        &self,
+        upload_url: &str,
+        bucket: &str,
+        obj_key: &str,
+        upload_id: &str,
+        task_id: &str,
+        auth_info: &serde_json::Value,
+        callback: &serde_json::Value,
+        etags: &[String],
+    ) -> Result<(), QuarkError> {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUpload>{}</CompleteMultipartUpload>",
+            etags
+                .iter()
+                .enumerate()
+                .map(|(index, etag)| format!(
+                    "<Part><PartNumber>{}</PartNumber><ETag>{etag}</ETag></Part>",
+                    index + 1
+                ))
+                .collect::<String>()
+        );
+        let content_md5 = BASE64.encode(Md5::digest(xml.as_bytes()));
+        let callback_base64 = BASE64.encode(
+            serde_json::to_vec(callback).map_err(|err| QuarkError::Login(err.to_string()))?,
+        );
+        let date = http_date();
+        let auth_meta = format!(
+            "POST\\n{content_md5}\\napplication/xml\\n{date}\\nx-oss-callback:{callback_base64}\\nx-oss-date:{date}\\nx-oss-user-agent:{OSS_USER_AGENT}\\n/{bucket}/{obj_key}?uploadId={upload_id}"
+        );
+        let auth = self.upload_auth(task_id, auth_info, &auth_meta)?;
+        self.client
+            .post(oss_endpoint(upload_url, bucket, obj_key))
+            .query(&[("uploadId", upload_id)])
+            .header("Authorization", auth)
+            .header("Content-MD5", content_md5)
+            .header("Content-Type", "application/xml")
+            .header("x-oss-callback", callback_base64)
+            .header("x-oss-date", date)
+            .header("x-oss-user-agent", OSS_USER_AGENT)
+            .body(xml)
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    fn upload_auth(
+        &self,
+        task_id: &str,
+        auth_info: &serde_json::Value,
+        auth_meta: &str,
+    ) -> Result<String, QuarkError> {
+        let response: Envelope<UploadAuthData> = self
+            .client
+            .post(format!("{BASE_URL}/1/clouddrive/file/upload/auth"))
+            .query(API_PARAMS)
+            .header("Cookie", &self.cookie)
+            .header("Referer", "https://pan.quark.cn/")
+            .json(&json!({"auth_info": auth_info, "auth_meta": auth_meta, "task_id": task_id}))
+            .send()?
+            .error_for_status()?
+            .json()?;
+        Ok(response.into_data()?.auth_key)
     }
 
     /// Deletes a file or directory from the cloud drive.
@@ -376,6 +743,7 @@ impl QuarkClient {
     /// point at which the local delete may proceed; the next directory poll
     /// reconciles the final remote state.
     pub fn delete_file(&self, file_id: &str) -> Result<(), QuarkError> {
+        let started = Instant::now();
         let envelope: Envelope<serde_json::Value> = self
             .client
             .post(format!(
@@ -391,7 +759,18 @@ impl QuarkClient {
             .send()?
             .error_for_status()?
             .json()?;
-        envelope.into_data().map(|_| ())
+        envelope.into_data().map(|_| ())?;
+        tracing::info!(
+            target: "quarkdrive::api",
+            operation = "delete_file",
+            endpoint = "/1/clouddrive/file/delete",
+            file_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            returned = 0,
+            result = "ok",
+            "夸克 API 调用完成"
+        );
+        Ok(())
     }
 
     pub fn check_account(&self, root_id: &str) -> Result<usize, QuarkError> {
@@ -472,6 +851,82 @@ impl RawItem {
 #[derive(Deserialize)]
 struct DownloadData {
     download_url: String,
+}
+
+#[derive(Deserialize)]
+struct UploadAuthData {
+    auth_key: String,
+}
+
+fn ensure_success(value: &serde_json::Value) -> Result<(), QuarkError> {
+    let status = value
+        .get("status")
+        .and_then(|value| value_i64(value, &[]))
+        .unwrap_or(200);
+    let code = value
+        .get("code")
+        .and_then(|value| value_i64(value, &[]))
+        .unwrap_or(0);
+    if status != 200 || code != 0 {
+        return Err(QuarkError::Api {
+            code: if code != 0 { code } else { status },
+            message: value_string(value, &["message"]).unwrap_or_else(|| "未知错误".into()),
+        });
+    }
+    Ok(())
+}
+
+fn json_string(value: &serde_json::Value, key: &'static str) -> Result<String, QuarkError> {
+    value_string(value, &[key]).ok_or(QuarkError::Malformed(key))
+}
+
+fn first_json_string(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| value_string(value, path))
+}
+
+fn value_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn file_hashes(path: &Path) -> Result<(String, String), QuarkError> {
+    let mut file = File::open(path).map_err(|err| QuarkError::Login(err.to_string()))?;
+    let mut md5 = Md5::new();
+    let mut sha1 = Sha1::new();
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        md5.update(&buffer[..count]);
+        sha1.update(&buffer[..count]);
+    }
+    Ok((
+        format!("{:x}", md5.finalize()),
+        format!("{:x}", sha1.finalize()),
+    ))
+}
+
+fn oss_endpoint(upload_url: &str, bucket: &str, obj_key: &str) -> String {
+    let host = upload_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    format!("https://{bucket}.{host}/{obj_key}")
+}
+
+fn http_date() -> String {
+    httpdate::fmt_http_date(std::time::SystemTime::now())
+}
+
+fn unix_time_ms(value: std::time::SystemTime) -> Option<i64> {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
 
 fn normalize_cookie(value: &str) -> String {
