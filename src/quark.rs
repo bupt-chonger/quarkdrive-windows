@@ -453,8 +453,6 @@ impl QuarkClient {
             "move_file",
             "/1/clouddrive/file/move",
             json!({
-                "action_type": 2,
-                "exclude_fids": [],
                 "filelist": [file_id],
                 "to_pdir_fid": target_parent_id,
             }),
@@ -500,14 +498,34 @@ impl QuarkClient {
     }
 
     pub fn upload_file(&self, path: &Path, parent_id: &str) -> Result<RemoteItem, QuarkError> {
-        let started = Instant::now();
-        let metadata = std::fs::metadata(path).map_err(|err| QuarkError::Login(err.to_string()))?;
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
             .ok_or(QuarkError::Malformed("local file name"))?;
+        self.upload_file_named(path, parent_id, name)
+    }
+
+    fn upload_file_named(
+        &self,
+        path: &Path,
+        parent_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem, QuarkError> {
+        let started = Instant::now();
+        let metadata = std::fs::metadata(path)?;
         let size = metadata.len();
         let (md5, sha1) = file_hashes(path)?;
+        let now_ms = unix_time_ms(std::time::SystemTime::now()).unwrap_or_default();
+        let created_at_ms = metadata
+            .created()
+            .ok()
+            .and_then(unix_time_ms)
+            .unwrap_or(now_ms);
+        let modified_at_ms = metadata
+            .modified()
+            .ok()
+            .and_then(unix_time_ms)
+            .unwrap_or(now_ms);
         let pre_response: serde_json::Value = self
             .client
             .post(format!("{BASE_URL}/1/clouddrive/file/upload/pre"))
@@ -533,16 +551,33 @@ impl QuarkClient {
             .get("data")
             .cloned()
             .ok_or(QuarkError::Malformed("data"))?;
+        let fid = json_string(&data, "fid")?;
         let task_id = json_string(&data, "task_id")?;
-        let obj_key = json_string(&data, "obj_key")?;
-        let upload_id = json_string(&data, "upload_id")?;
-        let bucket = json_string(&data, "bucket")?;
-        let upload_url = json_string(&data, "upload_url")?;
-        let auth_info = data
-            .get("auth_info")
-            .cloned()
-            .ok_or(QuarkError::Malformed("data.auth_info"))?;
-        let callback = data.get("callback").cloned().unwrap_or_else(|| json!({}));
+        let item = RemoteItem {
+            id: fid,
+            parent_id: parent_id.to_string(),
+            name: name.to_string(),
+            is_directory: false,
+            size,
+            created_at_ms,
+            modified_at_ms,
+            version: format!("{modified_at_ms}:{size}:{sha1}"),
+        };
+        if data.get("finish").and_then(|value| value.as_bool()) == Some(true) {
+            tracing::info!(
+                target: "quarkdrive::api",
+                operation = "upload_file",
+                endpoint = "/1/clouddrive/file/upload/pre",
+                parent_id,
+                name,
+                bytes = size,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                returned = 1,
+                result = "ok",
+                "夸克 API 快速上传完成"
+            );
+            return Ok(item);
+        }
         let hash_response: serde_json::Value = self
             .client
             .post(format!("{BASE_URL}/1/clouddrive/file/update/hash"))
@@ -559,12 +594,43 @@ impl QuarkClient {
             .and_then(|value| value.get("finish"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        if rapid {
+            tracing::info!(
+                target: "quarkdrive::api",
+                operation = "upload_file",
+                endpoint = "/1/clouddrive/file/update/hash",
+                parent_id,
+                name,
+                bytes = size,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                returned = 1,
+                result = "ok",
+                "夸克 API 哈希秒传完成"
+            );
+            return Ok(item);
+        }
+        if size == 0 {
+            return Err(QuarkError::Api {
+                code: 500,
+                message: "夸克接口未完成零字节文件上传".into(),
+            });
+        }
+        let obj_key = json_string(&data, "obj_key")?;
+        let upload_id = json_string(&data, "upload_id")?;
+        let bucket = json_string(&data, "bucket")?;
+        let upload_url = json_string(&data, "upload_url")?;
+        let auth_info = data
+            .get("auth_info")
+            .cloned()
+            .ok_or(QuarkError::Malformed("data.auth_info"))?;
+        let callback = data.get("callback").cloned().unwrap_or_else(|| json!({}));
         if !rapid {
-            let part_size = data
-                .get("part_size")
+            let part_size = pre_response
+                .get("metadata")
+                .and_then(|value| value.get("part_size"))
                 .and_then(value_u64)
                 .unwrap_or(8 * 1024 * 1024) as usize;
-            let mut file = File::open(path).map_err(|err| QuarkError::Login(err.to_string()))?;
+            let mut file = File::open(path)?;
             let mut part_number = 1_u32;
             let mut etags = Vec::new();
             loop {
@@ -609,12 +675,6 @@ impl QuarkClient {
             .error_for_status()?
             .json()?;
         ensure_success(&finish_response)?;
-        let item = self
-            .list_children(parent_id)?
-            .into_iter()
-            .rev()
-            .find(|item| !item.is_directory && item.name == name && item.size == size)
-            .ok_or(QuarkError::Malformed("uploaded file metadata"))?;
         tracing::info!(
             target: "quarkdrive::api",
             operation = "upload_file",
@@ -628,6 +688,44 @@ impl QuarkClient {
             "夸克 API 调用完成"
         );
         Ok(item)
+    }
+
+    pub fn replace_file(
+        &self,
+        path: &Path,
+        parent_id: &str,
+        old_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem, QuarkError> {
+        let token = uuid();
+        let staged_name = format!(".quarkdrive-upload-{token}");
+        let backup_name = format!(".quarkdrive-backup-{token}");
+        let staged = self.upload_file_named(path, parent_id, &staged_name)?;
+        if let Err(err) = self.rename_file(old_id, &backup_name) {
+            let _ = self.delete_file(&staged.id);
+            return Err(err);
+        }
+        if let Err(err) = self.rename_file(&staged.id, name) {
+            let _ = self.rename_file(old_id, name);
+            let _ = self.delete_file(&staged.id);
+            return Err(err);
+        }
+        if let Err(err) = self.delete_file(old_id) {
+            let _ = self.rename_file(&staged.id, &staged_name);
+            let _ = self.rename_file(old_id, name);
+            let _ = self.delete_file(&staged.id);
+            return Err(err);
+        }
+        Ok(RemoteItem {
+            id: staged.id,
+            parent_id: parent_id.to_string(),
+            name: name.to_string(),
+            is_directory: false,
+            size: staged.size,
+            created_at_ms: staged.created_at_ms,
+            modified_at_ms: staged.modified_at_ms,
+            version: staged.version,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -752,7 +850,7 @@ impl QuarkClient {
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&json!({
-                "action_type": 1,
+                "action_type": 2,
                 "filelist": [file_id],
                 "exclude_fids": [],
             }))

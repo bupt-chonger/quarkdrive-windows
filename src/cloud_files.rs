@@ -33,8 +33,8 @@ use windows::{
             CloudFilters::*,
             FileSystem::{
                 CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
-                FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
-                FILE_SHARE_WRITE, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
             },
         },
         System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
@@ -103,6 +103,18 @@ impl RemoteBackend {
     ) -> Result<RemoteItem, crate::quark::QuarkError> {
         match self {
             Self::Web(client) => client.upload_file(path, parent_id),
+        }
+    }
+
+    fn replace_file(
+        &self,
+        path: &Path,
+        parent_id: &str,
+        old_id: &str,
+        name: &str,
+    ) -> Result<RemoteItem, crate::quark::QuarkError> {
+        match self {
+            Self::Web(client) => client.replace_file(path, parent_id, old_id, name),
         }
     }
 
@@ -643,8 +655,9 @@ unsafe fn complete_placeholders(
 
 unsafe fn enable_on_demand_population_for_info(info: &CF_CALLBACK_INFO) -> Result<()> {
     anyhow::ensure!(!info.NormalizedPath.is_null(), "目录回调缺少标准化路径");
+    let context = unsafe { &*(info.CallbackContext as *const ProviderContext) };
     let path = unsafe { info.NormalizedPath.to_string() }.context("无法读取目录回调路径")?;
-    enable_on_demand_population(Path::new(&path))
+    enable_on_demand_population(&path_in_root(&context.root_path, &path))
 }
 
 fn enable_on_demand_population_tree(root: &Path) -> Result<()> {
@@ -723,12 +736,19 @@ unsafe extern "system" fn notify_rename(
 unsafe fn do_notify_rename(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMETERS) -> Result<()> {
     let context = unsafe { &*(info.CallbackContext as *const ProviderContext) };
     let flags = unsafe { params.Anonymous.Rename.Flags };
-    anyhow::ensure!(
-        flags.contains(CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE),
-        "重命名源不在夸克挂载目录内"
-    );
+    // A move from an ordinary local directory into the sync root is reported
+    // as a rename whose source is outside the scope. It is a new local item
+    // from the provider's point of view; the polling monitor uploads it after
+    // the move has settled.
+    if !flags.contains(CF_CALLBACK_RENAME_FLAG_SOURCE_IN_SCOPE) {
+        anyhow::ensure!(
+            flags.contains(CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE),
+            "重命名源和目标都不在夸克挂载目录内"
+        );
+        return Ok(());
+    }
     let file_id = unsafe { identity(info) }?;
-    let source = unsafe { callback_path(info.NormalizedPath) }?;
+    let source = unsafe { callback_path_in_root(&context.root_path, info.NormalizedPath) }?;
     if !flags.contains(CF_CALLBACK_RENAME_FLAG_TARGET_IN_SCOPE) {
         context.client.delete_file(&file_id)?;
         return Ok(());
@@ -736,6 +756,10 @@ unsafe fn do_notify_rename(info: &CF_CALLBACK_INFO, params: &CF_CALLBACK_PARAMET
     let target_raw = unsafe { params.Anonymous.Rename.TargetPath.to_string() }
         .context("无法读取重命名目标路径")?;
     let target = path_in_root(&context.root_path, &target_raw);
+    anyhow::ensure!(
+        path_in_scope(&context.root_path, &target),
+        "重命名目标不在夸克挂载目录内"
+    );
     let parent = target
         .parent()
         .ok_or_else(|| anyhow::anyhow!("重命名目标缺少父目录"))?;
@@ -787,8 +811,8 @@ unsafe extern "system" fn notify_file_close(
 
 unsafe fn do_notify_file_close(info: &CF_CALLBACK_INFO) -> Result<()> {
     let context = unsafe { &*(info.CallbackContext as *const ProviderContext) };
-    let path = unsafe { callback_path(info.NormalizedPath) }?;
-    if path.is_dir() || !path.starts_with(&context.root_path) {
+    let path = unsafe { callback_path_in_root(&context.root_path, info.NormalizedPath) }?;
+    if path.is_dir() || !path_in_scope(&context.root_path, &path) {
         return Ok(());
     }
     let Some(storage_info) = placeholder_storage_info(&path)? else {
@@ -810,11 +834,12 @@ unsafe fn do_notify_file_close(info: &CF_CALLBACK_INFO) -> Result<()> {
     let client = context.client.clone();
     std::thread::spawn(move || {
         let result = (|| -> Result<()> {
-            let uploaded = client.upload_file(&path, &parent_id)?;
-            if uploaded.id != file_id {
-                client.delete_file(&file_id)?;
-                update_placeholder_identity(&path, &uploaded.id)?;
-            }
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow::anyhow!("本地文件缺少文件名"))?;
+            let uploaded = client.replace_file(&path, &parent_id, &file_id, name)?;
+            update_placeholder_identity(&path, &uploaded.id)?;
             mark_placeholder_in_sync(&path)?;
             Ok(())
         })();
@@ -1015,20 +1040,37 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
 }
 
-unsafe fn callback_path(value: PCWSTR) -> Result<PathBuf> {
-    anyhow::ensure!(!value.is_null(), "Cloud Files 回调缺少文件路径");
-    Ok(PathBuf::from(
-        unsafe { value.to_string() }.context("无法读取 Cloud Files 回调路径")?,
-    ))
-}
-
 fn path_in_root(root: &Path, raw: &str) -> PathBuf {
     let raw_path = Path::new(raw);
-    if raw_path.is_absolute() && raw_path.starts_with(root) {
-        raw_path.to_path_buf()
-    } else {
-        root.join(raw.trim_start_matches(['\\', '/']))
+    if raw_path.is_absolute() {
+        return raw_path.to_path_buf();
     }
+    if raw.starts_with(['\\', '/']) {
+        // CFAPI may return a volume-rooted path such as
+        // `\Users\admin\QuarkDrive` without a drive prefix. Preserve the
+        // configured drive instead of appending it below the sync root.
+        let volume = root.components().take(2).collect::<PathBuf>();
+        return volume.join(raw.trim_start_matches(['\\', '/']));
+    }
+    root.join(raw.trim_start_matches(['\\', '/']))
+}
+
+unsafe fn callback_path_in_root(root: &Path, value: PCWSTR) -> Result<PathBuf> {
+    anyhow::ensure!(!value.is_null(), "Cloud Files 回调缺少标准化路径");
+    let raw = unsafe { value.to_string() }.context("无法读取 Cloud Files 回调路径")?;
+    Ok(path_in_root(root, &raw))
+}
+
+fn path_in_scope(root: &Path, candidate: &Path) -> bool {
+    let normalize = |path: &Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    let root = normalize(root);
+    let candidate = normalize(candidate);
+    candidate == root || candidate.starts_with(&(root + "\\"))
 }
 
 fn remote_parent_id(path: &Path, root: &Path, root_id: &str) -> Result<String> {
@@ -1136,7 +1178,7 @@ fn convert_local_to_placeholder(path: &Path, identity: &str, is_directory: bool)
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(path_wide.as_ptr()),
-                FILE_GENERIC_READ.0,
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
                 OPEN_EXISTING,
@@ -1230,11 +1272,13 @@ fn sync_new_local_entries(
             .map(|item| item.stable_cycles.saturating_add(1))
             .unwrap_or(1);
         if is_directory {
-            if previous
-                .as_ref()
-                .and_then(|item| item.remote_id.as_ref())
-                .is_some()
-            {
+            if let Some(remote_id) = previous.as_ref().and_then(|item| item.remote_id.as_ref()) {
+                // The remote object may have been created while Windows still
+                // had the directory open. Retry only the local conversion;
+                // never create duplicate remote folders on later scans.
+                if let Err(err) = convert_local_to_placeholder(&path, remote_id, true) {
+                    tracing::debug!(?err, path = %path.display(), "等待目录可转换为占位目录");
+                }
                 continue;
             }
             let Some(parent) = path.parent() else {
@@ -1289,11 +1333,10 @@ fn sync_new_local_entries(
                 );
                 continue;
             }
-            if previous
-                .as_ref()
-                .and_then(|item| item.remote_id.as_ref())
-                .is_some()
-            {
+            if let Some(remote_id) = previous.as_ref().and_then(|item| item.remote_id.as_ref()) {
+                if let Err(err) = convert_local_to_placeholder(&path, remote_id, false) {
+                    tracing::debug!(?err, path = %path.display(), "等待文件可转换为占位文件");
+                }
                 continue;
             }
             let Some(parent) = path.parent() else {
@@ -1363,5 +1406,18 @@ mod tests {
     #[test]
     fn converts_epoch() {
         assert_eq!(unix_ms_to_filetime(0), 116_444_736_000_000_000);
+    }
+
+    #[test]
+    fn resolves_volume_relative_callback_path() {
+        let root = Path::new(r"C:\Users\admin\QuarkDrive");
+        assert_eq!(
+            path_in_root(root, r"\Users\admin\QuarkDrive\folder"),
+            PathBuf::from(r"C:\Users\admin\QuarkDrive\folder")
+        );
+        assert!(path_in_scope(
+            root,
+            Path::new(r"c:\users\admin\quarkdrive\folder")
+        ));
     }
 }
