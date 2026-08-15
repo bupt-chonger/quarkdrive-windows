@@ -6,6 +6,7 @@ use anyhow::bail;
 use clap::{CommandFactory, Parser, Subcommand};
 use quarkdrive_windows::{
     config::{Config, default_config_path},
+    logging,
     quark::QuarkClient,
 };
 
@@ -82,12 +83,7 @@ fn main() -> Result<()> {
         println!("quarkdrive {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "quarkdrive=info".into()),
-        )
-        .init();
+    logging::init();
     let cli = Cli::parse();
     let path = cli.config.map(Ok).unwrap_or_else(default_config_path)?;
     #[cfg(windows)]
@@ -224,7 +220,7 @@ fn start(path: &std::path::Path) -> Result<()> {
                     start_on_login: true,
                     mount_path: default_mount_path(),
                 });
-                return quarkdrive_windows::windows_app::run(config, path.to_path_buf(), None);
+                quarkdrive_windows::windows_app::run(config, path.to_path_buf(), None)
             }
             #[cfg(not(windows))]
             return Err(err);
@@ -302,6 +298,9 @@ fn status(_: &Config) -> Result<()> {
 
 #[cfg(windows)]
 fn mount(config: Config, path: &std::path::Path) -> Result<()> {
+    let mut config = config;
+    quarkdrive_windows::cloud_files::normalize_remote_root(&mut config)?;
+    config.save(path)?;
     let connection = quarkdrive_windows::cloud_files::register_and_connect(&config)?;
     quarkdrive_windows::windows_app::run(config, path.to_path_buf(), Some(connection))
 }

@@ -37,9 +37,13 @@ use windows::{
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 
 use crate::{
-    cloud_files::{Connection, LocalStorageStats, release_local_storage, scan_local_storage},
+    cloud_files::{
+        Connection, LocalStorageEntry, LocalStorageStats, release_local_paths, scan_local_storage,
+        scan_local_storage_entries,
+    },
     config::Config,
-    quark::{QrCodeData, QrLoginResult, QuarkClient, QuarkQrLogin},
+    logging,
+    quark::{QrCodeData, QrLoginResult, QuarkClient, QuarkQrLogin, is_internal_name},
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -60,6 +64,10 @@ const ID_STORAGE_SCAN: usize = 2009;
 const ID_STORAGE_RELEASE: usize = 2010;
 const ID_LOGIN: usize = 2011;
 const ID_QR_CANCEL: usize = 2012;
+const ID_TAB_SETTINGS: usize = 2013;
+const ID_TAB_LOG: usize = 2014;
+const ID_LOG_REFRESH: usize = 2015;
+const ID_LOG_CLEAR: usize = 2016;
 const ICON_ID: u16 = 101;
 const SINGLE_INSTANCE_NAME: PCWSTR = w!("Local\\QuarkDriveWindows.SingleInstance");
 
@@ -89,19 +97,31 @@ struct AppState {
     storage_detail: HWND,
     storage_scan_button: HWND,
     storage_release_button: HWND,
+    storage_list: HWND,
+    log_edit: HWND,
+    log_refresh_button: HWND,
+    log_clear_button: HWND,
+    open_button: HWND,
+    save_button: HWND,
+    cancel_button: HWND,
+    settings_controls: Vec<HWND>,
     storage_stats: LocalStorageStats,
+    storage_entries: Vec<LocalStorageEntry>,
     remote_roots: Vec<(String, String)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum StorageTask {
     Scan,
-    Release { expected_bytes: u64 },
+    Release {
+        selected: Vec<PathBuf>,
+        expected_bytes: u64,
+    },
 }
 
 struct StorageTaskResult {
     task: StorageTask,
-    result: std::result::Result<LocalStorageStats, String>,
+    result: std::result::Result<(LocalStorageStats, Vec<LocalStorageEntry>), String>,
 }
 
 struct LoginDone {
@@ -155,7 +175,16 @@ pub fn run(config: Config, config_path: PathBuf, connection: Option<Connection>)
             storage_detail: HWND::default(),
             storage_scan_button: HWND::default(),
             storage_release_button: HWND::default(),
+            storage_list: HWND::default(),
+            log_edit: HWND::default(),
+            log_refresh_button: HWND::default(),
+            log_clear_button: HWND::default(),
+            open_button: HWND::default(),
+            save_button: HWND::default(),
+            cancel_button: HWND::default(),
+            settings_controls: Vec::new(),
             storage_stats: LocalStorageStats::default(),
+            storage_entries: Vec::new(),
             remote_roots,
         });
         let state_ptr = Box::into_raw(state);
@@ -167,7 +196,7 @@ pub fn run(config: Config, config_path: PathBuf, connection: Option<Connection>)
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             720,
-            754,
+            862,
             None,
             None,
             Some(instance),
@@ -369,6 +398,30 @@ unsafe fn create_controls(hwnd: HWND, state: &mut AppState) -> Result<()> {
             30,
             0,
             0,
+        )?;
+        create(
+            hwnd,
+            instance,
+            w!("BUTTON"),
+            "设置",
+            494,
+            20,
+            78,
+            30,
+            BS_PUSHBUTTON as u32,
+            ID_TAB_SETTINGS,
+        )?;
+        create(
+            hwnd,
+            instance,
+            w!("BUTTON"),
+            "日志",
+            580,
+            20,
+            78,
+            30,
+            BS_PUSHBUTTON as u32,
+            ID_TAB_LOG,
         )?;
         create(
             hwnd,
@@ -598,7 +651,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut AppState) -> Result<()> {
             24,
             514,
             654,
-            126,
+            236,
             BS_GROUPBOX as u32,
             0,
         )?;
@@ -609,7 +662,7 @@ unsafe fn create_controls(hwnd: HWND, state: &mut AppState) -> Result<()> {
             "正在检测本地文件容量…",
             48,
             548,
-            350,
+            600,
             24,
             0,
             0,
@@ -620,10 +673,22 @@ unsafe fn create_controls(hwnd: HWND, state: &mut AppState) -> Result<()> {
             w!("STATIC"),
             "仅统计已下载到本机的网盘文件",
             48,
-            577,
+            704,
             390,
             22,
             0,
+            0,
+        )?;
+        state.storage_list = create(
+            hwnd,
+            instance,
+            w!("LISTBOX"),
+            "",
+            48,
+            578,
+            602,
+            116,
+            WS_BORDER.0 | WS_VSCROLL.0 | LBS_EXTENDEDSEL as u32 | LBS_NOINTEGRALHEIGHT as u32,
             0,
         )?;
         state.storage_scan_button = create(
@@ -631,8 +696,8 @@ unsafe fn create_controls(hwnd: HWND, state: &mut AppState) -> Result<()> {
             instance,
             w!("BUTTON"),
             "重新检测",
-            444,
-            558,
+            48,
+            738,
             94,
             34,
             BS_PUSHBUTTON as u32,
@@ -643,50 +708,112 @@ unsafe fn create_controls(hwnd: HWND, state: &mut AppState) -> Result<()> {
             instance,
             w!("BUTTON"),
             "释放空间",
-            550,
-            558,
+            154,
+            738,
             100,
             34,
             BS_PUSHBUTTON as u32,
             ID_STORAGE_RELEASE,
         )?;
         let _ = EnableWindow(state.storage_release_button, false);
-        create(
+        state.open_button = create(
             hwnd,
             instance,
             w!("BUTTON"),
             "打开网盘",
             24,
-            666,
+            774,
             100,
             32,
             BS_PUSHBUTTON as u32,
             ID_OPEN_FOLDER,
         )?;
-        create(
+        state.save_button = create(
             hwnd,
             instance,
             w!("BUTTON"),
             "保存并重启",
             436,
-            666,
+            774,
             112,
             32,
             BS_DEFPUSHBUTTON as u32,
             ID_SAVE,
         )?;
-        create(
+        state.cancel_button = create(
             hwnd,
             instance,
             w!("BUTTON"),
             "取消",
             562,
-            666,
+            774,
             100,
             32,
             BS_PUSHBUTTON as u32,
             ID_CANCEL,
         )?;
+        state.log_edit = create(
+            hwnd,
+            instance,
+            w!("EDIT"),
+            "",
+            24,
+            88,
+            654,
+            654,
+            WS_BORDER.0
+                | WS_VSCROLL.0
+                | WS_HSCROLL.0
+                | ES_MULTILINE as u32
+                | ES_AUTOVSCROLL as u32
+                | ES_AUTOHSCROLL as u32
+                | ES_READONLY as u32,
+            0,
+        )?;
+        state.log_refresh_button = create(
+            hwnd,
+            instance,
+            w!("BUTTON"),
+            "刷新日志",
+            436,
+            774,
+            112,
+            32,
+            BS_PUSHBUTTON as u32,
+            ID_LOG_REFRESH,
+        )?;
+        state.log_clear_button = create(
+            hwnd,
+            instance,
+            w!("BUTTON"),
+            "清理日志",
+            562,
+            774,
+            100,
+            32,
+            BS_PUSHBUTTON as u32,
+            ID_LOG_CLEAR,
+        )?;
+        state.settings_controls = vec![
+            state.account_status,
+            state.account_detail,
+            state.login_button,
+            state.root_combo,
+            state.path_edit,
+            state.name_edit,
+            state.startup_check,
+            state.storage_status,
+            state.storage_detail,
+            state.storage_list,
+            state.storage_scan_button,
+            state.storage_release_button,
+            state.open_button,
+            state.save_button,
+            state.cancel_button,
+        ];
+        let _ = ShowWindow(state.log_edit, SW_HIDE);
+        let _ = ShowWindow(state.log_refresh_button, SW_HIDE);
+        let _ = ShowWindow(state.log_clear_button, SW_HIDE);
         begin_storage_task(hwnd, state, StorageTask::Scan);
     }
     Ok(())
@@ -971,6 +1098,15 @@ unsafe fn handle_command(hwnd: HWND, state: &mut AppState, id: usize) {
     match id {
         ID_OPEN | ID_OPEN_FOLDER => open_folder(&state.config.mount_path),
         ID_SETTINGS => unsafe { show_settings(hwnd) },
+        ID_TAB_SETTINGS => unsafe { set_tab(state, false) },
+        ID_TAB_LOG => unsafe { set_tab(state, true) },
+        ID_LOG_REFRESH => unsafe { refresh_log_view(state) },
+        ID_LOG_CLEAR => {
+            if let Err(err) = logging::clear() {
+                unsafe { show_error(hwnd, &err.to_string()) };
+            }
+            unsafe { refresh_log_view(state) };
+        }
         ID_CANCEL => {
             let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
         }
@@ -986,13 +1122,24 @@ unsafe fn handle_command(hwnd: HWND, state: &mut AppState, id: usize) {
         ID_STORAGE_SCAN => unsafe { begin_storage_task(hwnd, state, StorageTask::Scan) },
         ID_LOGIN => unsafe { begin_qr_login(hwnd, state) },
         ID_STORAGE_RELEASE => {
-            let bytes = state.storage_stats.releasable_bytes;
-            if bytes == 0 {
+            let selected = unsafe { selected_storage_paths(state) };
+            let bytes = selected
+                .iter()
+                .filter_map(|path| {
+                    state
+                        .storage_entries
+                        .iter()
+                        .find(|entry| &entry.path == path)
+                })
+                .map(|entry| entry.releasable_bytes)
+                .sum::<u64>();
+            if selected.is_empty() || bytes == 0 {
                 unsafe { show_info(hwnd, "当前没有可释放的本地网盘文件。") };
             } else {
                 let message = format!(
-                    "将释放 {} 本地空间。\n\n文件仍会保留在夸克网盘和资源管理器中，再次打开时会按需下载。标记为“始终保留在此设备上”的文件不会被释放。",
-                    format_bytes(bytes)
+                    "将释放 {} 本地空间（{} 个目录/文件）。\n\n文件仍会保留在夸克网盘和资源管理器中，再次打开时会按需下载。标记为“始终保留在此设备上”的文件不会被释放。",
+                    format_bytes(bytes),
+                    selected.len()
                 );
                 if unsafe { confirm(hwnd, &message) } {
                     unsafe {
@@ -1000,6 +1147,7 @@ unsafe fn handle_command(hwnd: HWND, state: &mut AppState, id: usize) {
                             hwnd,
                             state,
                             StorageTask::Release {
+                                selected,
                                 expected_bytes: bytes,
                             },
                         )
@@ -1014,19 +1162,23 @@ unsafe fn handle_command(hwnd: HWND, state: &mut AppState, id: usize) {
 unsafe fn begin_storage_task(hwnd: HWND, state: &mut AppState, task: StorageTask) {
     let _ = unsafe { EnableWindow(state.storage_scan_button, false) };
     let _ = unsafe { EnableWindow(state.storage_release_button, false) };
-    let status = match task {
+    let status = match &task {
         StorageTask::Scan => "正在检测本地文件容量…",
-        StorageTask::Release { .. } => "正在安全释放本地空间…",
+        StorageTask::Release { .. } => "正在按选择安全释放本地空间…",
     };
     let status = wide(status);
     let _ = unsafe { SetWindowTextW(state.storage_status, PCWSTR(status.as_ptr())) };
     let path = PathBuf::from(unsafe { control_text(state.path_edit) });
     let hwnd_value = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let result = match task {
-            StorageTask::Scan => scan_local_storage(&path),
-            StorageTask::Release { .. } => release_local_storage(&path),
-        }
+        let result = (|| -> Result<(LocalStorageStats, Vec<LocalStorageEntry>)> {
+            let stats = match &task {
+                StorageTask::Scan => scan_local_storage(&path)?,
+                StorageTask::Release { selected, .. } => release_local_paths(&path, selected)?,
+            };
+            let entries = scan_local_storage_entries(&path)?;
+            Ok((stats, entries))
+        })()
         .map_err(|err| err.to_string());
         let payload = Box::new(StorageTaskResult { task, result });
         let hwnd = HWND(hwnd_value as *mut _);
@@ -1044,8 +1196,10 @@ unsafe fn begin_storage_task(hwnd: HWND, state: &mut AppState, task: StorageTask
 unsafe fn finish_storage_task(hwnd: HWND, state: &mut AppState, result: StorageTaskResult) {
     let _ = unsafe { EnableWindow(state.storage_scan_button, true) };
     match result.result {
-        Ok(stats) => {
+        Ok((stats, entries)) => {
             state.storage_stats = stats;
+            state.storage_entries = entries;
+            unsafe { populate_storage_list(state) };
             let status = format!(
                 "本地占用 {} · 可释放 {}",
                 format_bytes(stats.local_bytes),
@@ -1062,7 +1216,7 @@ unsafe fn finish_storage_task(hwnd: HWND, state: &mut AppState, result: StorageT
             let _ = unsafe { SetWindowTextW(state.storage_detail, PCWSTR(detail_wide.as_ptr())) };
             let _ =
                 unsafe { EnableWindow(state.storage_release_button, stats.releasable_bytes > 0) };
-            if let StorageTask::Release { expected_bytes } = result.task {
+            if let StorageTask::Release { expected_bytes, .. } = result.task {
                 let released = expected_bytes.saturating_sub(stats.releasable_bytes);
                 unsafe {
                     show_info(
@@ -1081,6 +1235,96 @@ unsafe fn finish_storage_task(hwnd: HWND, state: &mut AppState, result: StorageT
             unsafe { show_error(hwnd, &err) };
         }
     }
+}
+
+unsafe fn selected_storage_paths(state: &AppState) -> Vec<PathBuf> {
+    let count = unsafe { SendMessageW(state.storage_list, LB_GETSELCOUNT, None, None).0 };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut indexes = vec![0_i32; count as usize];
+    let selected = unsafe {
+        SendMessageW(
+            state.storage_list,
+            LB_GETSELITEMS,
+            Some(WPARAM(indexes.len())),
+            Some(LPARAM(indexes.as_mut_ptr() as isize)),
+        )
+        .0
+    };
+    indexes
+        .into_iter()
+        .take(selected.max(0) as usize)
+        .filter_map(|index| state.storage_entries.get(index as usize))
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+unsafe fn populate_storage_list(state: &mut AppState) {
+    let _ = unsafe { SendMessageW(state.storage_list, LB_RESETCONTENT, None, None) };
+    for entry in &state.storage_entries {
+        let name = entry
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| entry.path.display().to_string());
+        let label = format!(
+            "{}   {}   ({} 个文件)",
+            name,
+            format_bytes(entry.releasable_bytes),
+            entry.file_count
+        );
+        let label = wide(&label);
+        let _ = unsafe {
+            SendMessageW(
+                state.storage_list,
+                LB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(label.as_ptr() as isize)),
+            )
+        };
+    }
+    // The safe default is to select every detected entry; users can clear
+    // individual rows before pressing “释放空间”.
+    for index in 0..state.storage_entries.len() {
+        let _ = unsafe {
+            SendMessageW(
+                state.storage_list,
+                LB_SETSEL,
+                Some(WPARAM(1)),
+                Some(LPARAM(index as isize)),
+            )
+        };
+    }
+}
+
+unsafe fn set_tab(state: &mut AppState, log_tab: bool) {
+    for control in &state.settings_controls {
+        let _ = unsafe { ShowWindow(*control, if log_tab { SW_HIDE } else { SW_SHOW }) };
+    }
+    let _ = unsafe { ShowWindow(state.log_edit, if log_tab { SW_SHOW } else { SW_HIDE }) };
+    let _ = unsafe {
+        ShowWindow(
+            state.log_refresh_button,
+            if log_tab { SW_SHOW } else { SW_HIDE },
+        )
+    };
+    let _ = unsafe {
+        ShowWindow(
+            state.log_clear_button,
+            if log_tab { SW_SHOW } else { SW_HIDE },
+        )
+    };
+    if log_tab {
+        unsafe { refresh_log_view(state) };
+    }
+}
+
+unsafe fn refresh_log_view(state: &mut AppState) {
+    let text = logging::read_tail(512 * 1024).unwrap_or_else(|err| format!("日志读取失败：{err}"));
+    let text = wide(&text);
+    let _ = unsafe { SetWindowTextW(state.log_edit, PCWSTR(text.as_ptr())) };
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1261,9 +1505,7 @@ fn load_remote_roots(config: &Config) -> Vec<(String, String)> {
             items
                 .into_iter()
                 .filter(|item| {
-                    item.is_directory
-                        && !item.name.starts_with(".quarkdrive-trash-")
-                        && !item.name.starts_with("_quarkdrive_trash_")
+                    item.is_directory && item.is_writable && !is_internal_name(&item.name)
                 })
                 .map(|item| (item.id, item.name)),
         );
