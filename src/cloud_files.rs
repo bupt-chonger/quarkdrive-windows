@@ -144,6 +144,39 @@ pub struct Connection {
     watcher: Option<JoinHandle<()>>,
 }
 
+/// A PC-backup directory is readable through the normal list API but is not a
+/// writable parent for the file-management APIs. Keep it out of the sync root
+/// configuration so local create/upload operations always target a writable
+/// drive directory.
+pub fn normalize_remote_root(config: &mut Config) -> Result<()> {
+    if config.cookie.trim().is_empty() || config.remote_root_id == "0" {
+        return Ok(());
+    }
+    let client = QuarkClient::new(&config.cookie)?;
+    let items = client.list_children("0")?;
+    let Some(root) = items.iter().find(|item| item.id == config.remote_root_id) else {
+        tracing::warn!(
+            remote_root_id = %config.remote_root_id,
+            "配置的远端根目录已不存在，回退到全部文件"
+        );
+        config.remote_root_id = "0".into();
+        config.remote_root_name = "夸克网盘".into();
+        config.remote_root_label = "全部文件".into();
+        return Ok(());
+    };
+    if !root.is_writable {
+        tracing::warn!(
+            remote_root_id = %root.id,
+            remote_root_name = %root.name,
+            "配置的远端根目录为只读备份目录，回退到全部文件"
+        );
+        config.remote_root_id = "0".into();
+        config.remote_root_name = "夸克网盘".into();
+        config.remote_root_label = "全部文件".into();
+    }
+    Ok(())
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         self.watcher_stop.store(true, Ordering::Relaxed);
@@ -640,6 +673,14 @@ unsafe fn complete_placeholders(
     status: NTSTATUS,
 ) {
     let op_info = operation_info(info, CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
+    // An empty remote directory is a valid population result. CFAPI requires
+    // a null PlaceholderArray for that case; Vec::as_mut_ptr() on an empty
+    // vector is a dangling non-null pointer and produces 0x8007017C.
+    let placeholder_array = if placeholders.is_empty() {
+        ptr::null_mut()
+    } else {
+        placeholders.as_mut_ptr()
+    };
     let transfer = CF_OPERATION_PARAMETERS_0_4 {
         // The directory is fully listed in one response. Re-enable on-demand
         // population after the transfer so a later Explorer Refresh can ask
@@ -647,7 +688,7 @@ unsafe fn complete_placeholders(
         Flags: CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
         CompletionStatus: status,
         PlaceholderTotalCount: placeholders.len() as i64,
-        PlaceholderArray: placeholders.as_mut_ptr(),
+        PlaceholderArray: placeholder_array,
         PlaceholderCount: placeholders.len() as u32,
         EntriesProcessed: 0,
     };
@@ -1244,9 +1285,31 @@ fn start_change_monitor(
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        // A previous build could have populated this mount from a read-only
+        // PC-backup root. Those placeholders remain on disk after the root is
+        // corrected, but their identities are not valid parents in the new
+        // root. Keep them visible and untouched; do not retry their children
+        // as new local uploads on every polling cycle.
+        let stale_roots = match find_stale_local_roots(&root, &client, &root_id) {
+            Ok(roots) => {
+                if !roots.is_empty() {
+                    tracing::warn!(
+                        roots = ?roots,
+                        "发现旧只读备份占位目录，保留本地内容并停止对其子项重试上传"
+                    );
+                }
+                roots
+            }
+            Err(err) => {
+                tracing::debug!(?err, "检查旧只读备份占位目录失败");
+                Vec::new()
+            }
+        };
         let mut known = HashMap::<PathBuf, LocalObservation>::new();
         while !stop.load(Ordering::Relaxed) {
-            if let Err(err) = sync_new_local_entries(&root, &client, &root_id, &mut known) {
+            if let Err(err) =
+                sync_new_local_entries(&root, &client, &root_id, &stale_roots, &mut known)
+            {
                 tracing::warn!(?err, "扫描挂载目录变更失败");
             }
             for _ in 0..20 {
@@ -1263,10 +1326,11 @@ fn sync_new_local_entries(
     root: &Path,
     client: &RemoteBackend,
     root_id: &str,
+    stale_roots: &[PathBuf],
     known: &mut HashMap<PathBuf, LocalObservation>,
 ) -> Result<()> {
     let mut entries = Vec::new();
-    collect_local_entries(root, &mut entries)?;
+    collect_local_entries(root, stale_roots, &mut entries)?;
     entries.sort_by_key(|(path, is_directory, _, _)| {
         (if *is_directory { 0 } else { 1 }, path.components().count())
     });
@@ -1383,12 +1447,19 @@ fn sync_new_local_entries(
     Ok(())
 }
 
-fn collect_local_entries(root: &Path, entries: &mut Vec<(PathBuf, bool, u64, i64)>) -> Result<()> {
+fn collect_local_entries(
+    root: &Path,
+    stale_roots: &[PathBuf],
+    entries: &mut Vec<(PathBuf, bool, u64, i64)>,
+) -> Result<()> {
     for entry in fs::read_dir(root).with_context(|| format!("无法扫描 {}", root.display()))? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if is_internal_name(&name) {
+            continue;
+        }
+        if stale_roots.iter().any(|stale| path_is_under(&path, stale)) {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -1401,7 +1472,7 @@ fn collect_local_entries(root: &Path, entries: &mut Vec<(PathBuf, bool, u64, i64
             .unwrap_or_default();
         if file_type.is_dir() {
             entries.push((path.clone(), true, 0, modified_ms));
-            if let Err(err) = collect_local_entries(&path, entries) {
+            if let Err(err) = collect_local_entries(&path, stale_roots, entries) {
                 tracing::debug!(?err, path = %path.display(), "跳过无法扫描的本地目录");
             }
         } else if file_type.is_file() {
@@ -1409,6 +1480,36 @@ fn collect_local_entries(root: &Path, entries: &mut Vec<(PathBuf, bool, u64, i64
         }
     }
     Ok(())
+}
+
+fn find_stale_local_roots(
+    root: &Path,
+    client: &RemoteBackend,
+    root_id: &str,
+) -> Result<Vec<PathBuf>> {
+    let remote_items = client
+        .list_children(root_id)
+        .context("无法读取当前远端根目录")?;
+    let mut stale = Vec::new();
+    for entry in fs::read_dir(root).with_context(|| format!("无法扫描 {}", root.display()))? {
+        let entry = entry?;
+        if entry_name_is_internal(&entry) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(identity) = placeholder_identity(&path)? else {
+            continue;
+        };
+        let current = remote_items.iter().find(|item| item.id == identity);
+        if current.is_none_or(|item| !item.is_writable) {
+            stale.push(path);
+        }
+    }
+    Ok(stale)
+}
+
+fn path_is_under(path: &Path, parent: &Path) -> bool {
+    paths_equal(path, parent) || path.starts_with(parent)
 }
 
 fn entry_name_is_internal(entry: &fs::DirEntry) -> bool {

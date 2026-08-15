@@ -14,15 +14,19 @@ use reqwest::{
     Url,
     blocking::Client,
     cookie::{CookieStore, Jar},
+    header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use sha1::Sha1;
 use thiserror::Error;
 
-const BASE_URL: &str = "https://drive.quark.cn";
-const API_PARAMS: &[(&str, &str)] = &[("pr", "ucpro"), ("fr", "pc"), ("uc_param_str", "")];
+// File-management APIs (create, upload, move and delete) are served from the
+// PC drive host. The older drive.quark.cn host may still answer read requests
+// but rejects mutations with HTTP 400.
+const BASE_URL: &str = "https://drive-pc.quark.cn";
 const OSS_USER_AGENT: &str = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit";
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0";
 
 /// Names reserved by the sync implementation for recycle-bin and staged
 /// upload objects. They are implementation details, not user files, and must
@@ -35,12 +39,27 @@ pub fn is_internal_name(name: &str) -> bool {
         || name.starts_with(".quarkdrive-backup-")
 }
 
+fn api_params() -> Vec<(&'static str, String)> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    vec![
+        ("pr", "ucpro".into()),
+        ("fr", "pc".into()),
+        ("uc_param_str", String::new()),
+        ("__dt", (now_ms % 9_900 + 100).to_string()),
+        ("__t", now_ms.to_string()),
+    ]
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RemoteItem {
     pub id: String,
     pub parent_id: String,
     pub name: String,
     pub is_directory: bool,
+    pub is_writable: bool,
     pub size: u64,
     pub created_at_ms: i64,
     pub modified_at_ms: i64,
@@ -305,8 +324,15 @@ pub struct QuarkClient {
 
 impl QuarkClient {
     pub fn new(cookie: impl Into<String>) -> Result<Self, QuarkError> {
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert("Origin", HeaderValue::from_static("https://pan.quark.cn"));
+        default_headers.insert(
+            "Accept-Language",
+            HeaderValue::from_static("zh-CN,zh;q=0.9"),
+        );
         let client = Client::builder()
-            .user_agent("QuarkDriveWindows/0.1")
+            .default_headers(default_headers)
+            .user_agent(BROWSER_USER_AGENT)
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
@@ -323,9 +349,8 @@ impl QuarkClient {
             let envelope: Envelope<ListData> = self
                 .client
                 .get(format!("{BASE_URL}/1/clouddrive/file/sort"))
+                .query(&api_params())
                 .query(&[
-                    ("pr", "ucpro"),
-                    ("fr", "pc"),
                     ("pdir_fid", parent_id),
                     ("_page", &page.to_string()),
                     ("_size", "500"),
@@ -433,10 +458,10 @@ impl QuarkClient {
 
     pub fn create_folder(&self, parent_id: &str, name: &str) -> Result<String, QuarkError> {
         let started = Instant::now();
-        let response: Envelope<serde_json::Value> = self
+        let response = self
             .client
             .post(format!("{BASE_URL}/1/clouddrive/file"))
-            .query(API_PARAMS)
+            .query(&api_params())
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&json!({
@@ -445,9 +470,8 @@ impl QuarkClient {
                 "dir_path": "",
                 "dir_init_lock": false,
             }))
-            .send()?
-            .error_for_status()?
-            .json()?;
+            .send()?;
+        let response: Envelope<serde_json::Value> = response_json_or_api_error(response)?;
         let data = response.into_data()?;
         let id = first_json_string(&data, &[&["fid"], &["data", "fid"]])
             .ok_or(QuarkError::Malformed("data.fid"))?;
@@ -494,7 +518,7 @@ impl QuarkClient {
         let envelope: Envelope<serde_json::Value> = self
             .client
             .post(format!("{BASE_URL}{endpoint}"))
-            .query(API_PARAMS)
+            .query(&api_params())
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&body)
@@ -543,10 +567,10 @@ impl QuarkClient {
             .ok()
             .and_then(unix_time_ms)
             .unwrap_or(now_ms);
-        let pre_response: serde_json::Value = self
+        let pre_response_response = self
             .client
             .post(format!("{BASE_URL}/1/clouddrive/file/upload/pre"))
-            .query(API_PARAMS)
+            .query(&api_params())
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&json!({
@@ -560,9 +584,8 @@ impl QuarkClient {
                 "pdir_fid": parent_id,
                 "size": size,
             }))
-            .send()?
-            .error_for_status()?
-            .json()?;
+            .send()?;
+        let pre_response: serde_json::Value = response_json_or_api_error(pre_response_response)?;
         ensure_success(&pre_response)?;
         let data = pre_response
             .get("data")
@@ -575,6 +598,7 @@ impl QuarkClient {
             parent_id: parent_id.to_string(),
             name: name.to_string(),
             is_directory: false,
+            is_writable: true,
             size,
             created_at_ms,
             modified_at_ms,
@@ -598,7 +622,7 @@ impl QuarkClient {
         let hash_response: serde_json::Value = self
             .client
             .post(format!("{BASE_URL}/1/clouddrive/file/update/hash"))
-            .query(API_PARAMS)
+            .query(&api_params())
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&json!({"md5": md5, "sha1": sha1, "task_id": task_id}))
@@ -684,7 +708,7 @@ impl QuarkClient {
         let finish_response: serde_json::Value = self
             .client
             .post(format!("{BASE_URL}/1/clouddrive/file/upload/finish"))
-            .query(API_PARAMS)
+            .query(&api_params())
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&json!({"obj_key": obj_key, "task_id": task_id}))
@@ -738,6 +762,7 @@ impl QuarkClient {
             parent_id: parent_id.to_string(),
             name: name.to_string(),
             is_directory: false,
+            is_writable: true,
             size: staged.size,
             created_at_ms: staged.created_at_ms,
             modified_at_ms: staged.modified_at_ms,
@@ -841,7 +866,7 @@ impl QuarkClient {
         let response: Envelope<UploadAuthData> = self
             .client
             .post(format!("{BASE_URL}/1/clouddrive/file/upload/auth"))
-            .query(API_PARAMS)
+            .query(&api_params())
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&json!({"auth_info": auth_info, "auth_meta": auth_meta, "task_id": task_id}))
@@ -861,9 +886,8 @@ impl QuarkClient {
         let started = Instant::now();
         let envelope: Envelope<serde_json::Value> = self
             .client
-            .post(format!(
-                "{BASE_URL}/1/clouddrive/file/delete?pr=ucpro&fr=pc&uc_param_str="
-            ))
+            .post(format!("{BASE_URL}/1/clouddrive/file/delete"))
+            .query(&api_params())
             .header("Cookie", &self.cookie)
             .header("Referer", "https://pan.quark.cn/")
             .json(&json!({
@@ -938,6 +962,12 @@ struct RawItem {
     #[serde(default, deserialize_with = "number_or_string_i64")]
     updated_at: i64,
     content_hash: Option<String>,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    file_source: String,
+    #[serde(default)]
+    backup_source: bool,
 }
 
 impl RawItem {
@@ -950,11 +980,13 @@ impl RawItem {
             self.size,
             self.content_hash.unwrap_or_default()
         );
+        let source = format!("{} {}", self.source, self.file_source).to_ascii_lowercase();
         Some(RemoteItem {
             id,
             parent_id: parent_id.into(),
             name,
             is_directory: self.dir,
+            is_writable: !self.backup_source && !source.contains("backup"),
             size: if self.dir { 0 } else { self.size },
             created_at_ms: self.created_at,
             modified_at_ms: self.updated_at,
@@ -989,6 +1021,25 @@ fn ensure_success(value: &serde_json::Value) -> Result<(), QuarkError> {
         });
     }
     Ok(())
+}
+
+fn response_json_or_api_error<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T, QuarkError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        let message = body.chars().take(500).collect::<String>();
+        return Err(QuarkError::Api {
+            code: i64::from(status.as_u16()),
+            message: if message.is_empty() {
+                status.to_string()
+            } else {
+                message
+            },
+        });
+    }
+    Ok(response.json()?)
 }
 
 fn json_string(value: &serde_json::Value, key: &'static str) -> Result<String, QuarkError> {
@@ -1099,5 +1150,19 @@ mod tests {
         assert!(is_internal_name(".quarkdrive-backup-123"));
         assert!(is_internal_name("_quarkdrive_trash_123"));
         assert!(!is_internal_name("我的文件夹"));
+    }
+
+    #[test]
+    fn backup_directories_are_read_only() {
+        let raw: RawItem = serde_json::from_value(json!({
+            "fid": "backup",
+            "file_name": "我的备份",
+            "dir": true,
+            "source": "ucpro-pc:backup",
+            "file_source": "UCPRO-PC:BACKUP",
+            "backup_source": true
+        }))
+        .unwrap();
+        assert!(!raw.into_item("0").unwrap().is_writable);
     }
 }

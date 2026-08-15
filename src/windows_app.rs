@@ -1504,7 +1504,9 @@ fn load_remote_roots(config: &Config) -> Vec<(String, String)> {
         roots.extend(
             items
                 .into_iter()
-                .filter(|item| item.is_directory && !is_internal_name(&item.name))
+                .filter(|item| {
+                    item.is_directory && item.is_writable && !is_internal_name(&item.name)
+                })
                 .map(|item| (item.id, item.name)),
         );
     }

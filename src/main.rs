@@ -298,6 +298,9 @@ fn status(_: &Config) -> Result<()> {
 
 #[cfg(windows)]
 fn mount(config: Config, path: &std::path::Path) -> Result<()> {
+    let mut config = config;
+    quarkdrive_windows::cloud_files::normalize_remote_root(&mut config)?;
+    config.save(path)?;
     let connection = quarkdrive_windows::cloud_files::register_and_connect(&config)?;
     quarkdrive_windows::windows_app::run(config, path.to_path_buf(), Some(connection))
 }
