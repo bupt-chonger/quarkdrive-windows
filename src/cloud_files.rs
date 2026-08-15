@@ -1501,6 +1501,19 @@ fn find_stale_local_roots(
             continue;
         };
         let current = remote_items.iter().find(|item| item.id == identity);
+        if current.is_none() {
+            match remove_stale_empty_placeholder(&path) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        path = %path.display(),
+                        "清理已从云端消失的空占位目录失败"
+                    );
+                }
+            }
+        }
         if current.is_none_or(|item| !item.is_writable) {
             stale.push(path);
         }
@@ -1510,6 +1523,24 @@ fn find_stale_local_roots(
 
 fn path_is_under(path: &Path, parent: &Path) -> bool {
     paths_equal(path, parent) || path.starts_with(parent)
+}
+
+fn remove_stale_empty_placeholder(path: &Path) -> Result<bool> {
+    let mut children =
+        fs::read_dir(path).with_context(|| format!("无法检查失效占位目录 {}", path.display()))?;
+    if children.next().transpose()?.is_some() {
+        return Ok(false);
+    }
+    let path_wide = wide(path);
+    let handle =
+        unsafe { CfOpenFileWithOplock(PCWSTR(path_wide.as_ptr()), CF_OPEN_FILE_FLAG_WRITE_ACCESS) }
+            .with_context(|| format!("无法打开失效占位目录 {}", path.display()))?;
+    let result = unsafe { CfRevertPlaceholder(handle, CF_REVERT_FLAG_NONE, None) };
+    unsafe { CfCloseHandle(handle) };
+    result.context("无法移除失效目录的 Cloud Files 占位状态")?;
+    fs::remove_dir(path).with_context(|| format!("无法删除失效占位目录 {}", path.display()))?;
+    tracing::info!(path = %path.display(), "已清理云端不存在的空占位目录");
+    Ok(true)
 }
 
 fn entry_name_is_internal(entry: &fs::DirEntry) -> bool {
