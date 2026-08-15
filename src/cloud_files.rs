@@ -44,7 +44,7 @@ use windows::{
 
 use crate::{
     config::Config,
-    quark::{QuarkClient, RemoteItem},
+    quark::{QuarkClient, RemoteItem, is_internal_name},
 };
 
 const PROVIDER_ID: GUID = GUID::from_u128(0x7f86d767_7fe2_4cfb_93f8_84c0f279116d);
@@ -380,6 +380,9 @@ pub fn scan_local_storage_entries(root: &Path) -> Result<Vec<LocalStorageEntry>>
     let mut entries = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("无法扫描 {}", root.display()))? {
         let entry = entry?;
+        if entry_name_is_internal(&entry) {
+            continue;
+        }
         let path = entry.path();
         let mut stats = LocalStorageStats::default();
         if entry.file_type()?.is_dir() {
@@ -442,6 +445,9 @@ pub fn release_local_paths(root: &Path, targets: &[PathBuf]) -> Result<LocalStor
 fn scan_directory(path: &Path, stats: &mut LocalStorageStats) -> Result<()> {
     for entry in fs::read_dir(path).with_context(|| format!("无法扫描 {}", path.display()))? {
         let entry = entry?;
+        if entry_name_is_internal(&entry) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             if let Err(err) = scan_directory(&entry.path(), stats) {
@@ -470,6 +476,9 @@ fn scan_directory(path: &Path, stats: &mut LocalStorageStats) -> Result<()> {
 fn release_directory(path: &Path) -> Result<()> {
     for entry in fs::read_dir(path).with_context(|| format!("无法扫描 {}", path.display()))? {
         let entry = entry?;
+        if entry_name_is_internal(&entry) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             if let Err(err) = release_directory(&entry.path()) {
@@ -1262,6 +1271,13 @@ fn sync_new_local_entries(
         (if *is_directory { 0 } else { 1 }, path.components().count())
     });
     for (path, is_directory, size, modified_ms) in entries {
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(is_internal_name)
+        {
+            continue;
+        }
         if placeholder_identity(&path)?.is_some() {
             continue;
         }
@@ -1300,7 +1316,7 @@ fn sync_new_local_entries(
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or_default();
-            if name.starts_with(".quarkdrive-trash-") || name.starts_with("_quarkdrive_trash_") {
+            if is_internal_name(name) {
                 continue;
             }
             match client.create_folder(&parent_id, name) {
@@ -1372,7 +1388,7 @@ fn collect_local_entries(root: &Path, entries: &mut Vec<(PathBuf, bool, u64, i64
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(".quarkdrive-trash-") || name.starts_with("_quarkdrive_trash_") {
+        if is_internal_name(&name) {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -1393,6 +1409,10 @@ fn collect_local_entries(root: &Path, entries: &mut Vec<(PathBuf, bool, u64, i64
         }
     }
     Ok(())
+}
+
+fn entry_name_is_internal(entry: &fs::DirEntry) -> bool {
+    entry.file_name().to_str().is_some_and(is_internal_name)
 }
 
 #[cfg(test)]
@@ -1419,5 +1439,12 @@ mod tests {
             root,
             Path::new(r"c:\users\admin\quarkdrive\folder")
         ));
+    }
+
+    #[test]
+    fn internal_local_names_are_skipped() {
+        assert!(is_internal_name(".quarkdrive-trash-test"));
+        assert!(is_internal_name(".quarkdrive-upload-test"));
+        assert!(!is_internal_name("普通文件夹"));
     }
 }

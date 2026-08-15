@@ -24,6 +24,17 @@ const BASE_URL: &str = "https://drive.quark.cn";
 const API_PARAMS: &[(&str, &str)] = &[("pr", "ucpro"), ("fr", "pc"), ("uc_param_str", "")];
 const OSS_USER_AGENT: &str = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit";
 
+/// Names reserved by the sync implementation for recycle-bin and staged
+/// upload objects. They are implementation details, not user files, and must
+/// never be exposed as remote placeholders or uploaded from the local mount.
+pub fn is_internal_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with(".quarkdrive-trash-")
+        || name.starts_with("_quarkdrive_trash_")
+        || name.starts_with(".quarkdrive-upload-")
+        || name.starts_with(".quarkdrive-backup-")
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RemoteItem {
     pub id: String,
@@ -332,6 +343,12 @@ impl QuarkClient {
             result.extend(
                 data.list
                     .into_iter()
+                    .filter(|raw| {
+                        raw.file_name
+                            .as_deref()
+                            .map(|name| !is_internal_name(name))
+                            .unwrap_or(true)
+                    })
                     .filter_map(|raw| raw.into_item(parent_id)),
             );
             if count < 500 {
@@ -1071,5 +1088,16 @@ mod tests {
             (item.id.as_str(), item.size, item.version.as_str()),
             ("42", 12, "9:12:")
         );
+    }
+
+    #[test]
+    fn internal_names_are_hidden_from_sync() {
+        assert!(is_internal_name(
+            ".quarkdrive-trash-1f6b96db-4f6b-41de-87d3-0d32e2676b0b"
+        ));
+        assert!(is_internal_name(".quarkdrive-upload-123"));
+        assert!(is_internal_name(".quarkdrive-backup-123"));
+        assert!(is_internal_name("_quarkdrive_trash_123"));
+        assert!(!is_internal_name("我的文件夹"));
     }
 }

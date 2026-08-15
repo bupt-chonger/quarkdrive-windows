@@ -43,7 +43,7 @@ use crate::{
     },
     config::Config,
     logging,
-    quark::{QrCodeData, QrLoginResult, QuarkClient, QuarkQrLogin},
+    quark::{QrCodeData, QrLoginResult, QuarkClient, QuarkQrLogin, is_internal_name},
 };
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -1504,11 +1504,7 @@ fn load_remote_roots(config: &Config) -> Vec<(String, String)> {
         roots.extend(
             items
                 .into_iter()
-                .filter(|item| {
-                    item.is_directory
-                        && !item.name.starts_with(".quarkdrive-trash-")
-                        && !item.name.starts_with("_quarkdrive_trash_")
-                })
+                .filter(|item| item.is_directory && !is_internal_name(&item.name))
                 .map(|item| (item.id, item.name)),
         );
     }
